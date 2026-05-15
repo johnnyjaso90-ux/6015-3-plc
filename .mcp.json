@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "inoproshop": {
+      "type": "stdio",
+      "command": "C:\\Users\\zhou3\\AppData\\Roaming\\npm\\codesys-mcp-tool.cmd",
+      "args": [
+        "--codesys-path",
+        "C:\\Inovance Control\\InoProShop\\CODESYS\\Common\\InoProShop.exe",
+        "--codesys-profile",
+        "InoProShop",
+        "--workspace",
+        "D:\\HRV\\信利6015-3程序\\信利6015-3程序\\plc"
+      ]
+    }
+  }
+}

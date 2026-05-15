@@ -1,0 +1,15 @@
+# CODESYS / InoProShop
+*.compiled-library
+*.backup
+*.backup.*
+*.stack
+*.trace
+*.db
+*.~*
+*~
+
+# IDE / temp
+.vs/
+*.suo
+*.user
+*.tmp
