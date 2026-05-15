@@ -7,7 +7,7 @@
         "--codesys-path",
         "C:\\Inovance Control\\InoProShop\\CODESYS\\Common\\InoProShop.exe",
         "--codesys-profile",
-        "InoProShop",
+        "InoProShop(V1.9.1.6)",
         "--workspace",
         "D:\\HRV\\信利6015-3程序\\信利6015-3程序\\plc"
       ]
