@@ -3,25 +3,43 @@
 ## 问题
 
 1. MCP 工具每次调用都报 `SCRIPT_ERROR: Spawn failed`，但脚本已送达 IDE
-2. `--noUI` 模式下无法检测 IDE 中已打开的项目，且 `projects.open()` 被 Inovance 插件崩溃和设备预约冲突阻塞
+2. `--noUI` 模式下 `projects.open()` 触发 Inovance 插件崩溃（NullReferenceException）
+3. 去掉 `--noUI` 会导致每次 MCP 调用都弹出新的 IDE 窗口
 
 ## 根因
 
-1. **marker 优先级**：`codesys_interop.js` 中 spawn error 检查先于 `SCRIPT_SUCCESS` marker，Windows 上 `spawn` + `shell: true` + `AbortSignal` 会产生虚假 error
-2. **--noUI 进程隔离**：`--noUI` 启动独立 CODESYS 进程，`projects.primary` 为 None，无法看到 IDE 中已打开的项目。尝试 `projects.open()` 又与 IDE 的设备预约冲突
-3. **Inovance 插件**：`--noUI` 模式下 `InoObjectManager.OnProjectLoaded` 因缺少 UI 组件崩溃（NullReferenceException）
+1. **marker 优先级**：`codesys_interop.js` 中 spawn error 检查先于 `SCRIPT_SUCCESS` marker
+2. **AbortSignal + shell:true**：Node.js 的 `child_process.spawn` 在 Windows 上配合 `shell: true` + `AbortSignal` 会产生虚假的 "aborted" 错误
+3. **Inovance 插件**：`--noUI` 模式下 `InoObjectManager.OnProjectLoaded` 因缺少 UI 组件崩溃，但崩溃发生在项目加载**之后**（非致命回调副作用）
 
 ## 修复步骤
 
-编辑文件：
+编辑以下两个文件：
+
+### 文件 1：codesys_interop.js
+路径：`%APPDATA%\npm\node_modules\@codesys\mcp-toolkit\dist\codesys_interop.js`
+
+#### 修复 A：保持 --noUI（~第113行）
+```javascript
+// 保持 --noUI，避免弹出 IDE 窗口
+const fullCommandString = `${quotedExePath} ${profileArg} --noUI ${scriptArg}`;
 ```
-%APPDATA%\npm\node_modules\@codesys\mcp-toolkit\dist\codesys_interop.js
+
+#### 修复 B：移除 AbortSignal + 增加超时（~第131行）
+```javascript
+// 不要传 signal 给 spawn（Windows shell:true 兼容性问题）
+// 超时改为 120 秒，给项目加载留足时间
+const timeoutDuration = 120000;
+const childProcess = spawn(fullCommandString, [], {
+    windowsHide: true,
+    cwd: codesysDir,
+    env: spawnEnv,
+    shell: true
+    // 注意: 不传 signal 参数
+});
 ```
 
-### 修复 1：SCRIPT_SUCCESS marker 优先级 (~第197行)
-
-将 `// --- Success Determination Logic ---` 部分改为 marker 优先：
-
+#### 修复 C：marker 优先判断（~第197行）
 ```javascript
 const hasSuccessMarker = output.includes('SCRIPT_SUCCESS') || stderrOutput.includes('SCRIPT_SUCCESS');
 const hasErrorMarker = output.includes('SCRIPT_ERROR') || stderrOutput.includes('SCRIPT_ERROR');
@@ -35,20 +53,31 @@ if (hasSuccessMarker) {
 }
 ```
 
-### 修复 2：去掉 --noUI（~第113行）
+### 文件 2：ensure_project_open.py
+路径：`%APPDATA%\npm\node_modules\@codesys\mcp-toolkit\dist\scripts\ensure_project_open.py`
 
-`--noUI` 启动独立进程，无法检测 IDE 中已打开的项目。去掉它以连接到运行中的 IDE：
-
-```javascript
-// 去掉 --noUI（让脚本进程连接到运行中的 IDE）
-const fullCommandString = `${quotedExePath} ${profileArg} ${scriptArg}`;
+#### 修复 D：open() 异常后检查项目是否已加载（~第146行）
+```python
+except Exception as open_err:
+    print("ERROR: Exception during projects.open call: %s" % open_err)
+    traceback.print_exc()
+    # 插件崩溃可能发生在项目加载之后的回调中，
+    # 检查项目是否实际上已变为 primary
+    try:
+        post_err_primary = script_engine.projects.primary
+        if post_err_primary:
+            post_err_path = os.path.normcase(os.path.abspath(post_err_primary.path))
+            if post_err_path == normalized_target_path:
+                print("DEBUG: Project became primary despite open() exception.")
+                try:
+                    _ = len(post_err_primary.get_children(False))
+                    print("DEBUG: Project accessible. Proceeding.")
+                    return post_err_primary
+                except Exception as access_err:
+                    print("WARN: Not accessible: %s" % access_err)
+    except Exception as post_check_err:
+        print("WARN: %s" % post_check_err)
 ```
-
-### 使用流程
-
-1. 启动 InoProShop IDE
-2. 在 IDE 中手动打开项目
-3. 通过 MCP 工具（save、compile、create_pou 等）操作项目
 
 ## MCP 配置 (.mcp.json)
 
@@ -67,5 +96,11 @@ const fullCommandString = `${quotedExePath} ${profileArg} ${scriptArg}`;
   }
 }
 ```
+
+## 使用流程
+
+1. 确保 InoProShop IDE **未运行**（MCP 会通过 --noUI 自己启动 headless 实例）
+2. 直接使用 MCP 工具（open_project、compile、create_pou 等）
+3. 不需要手动打开 IDE
 
 修改后需重启 Claude Code 会话使改动生效。
