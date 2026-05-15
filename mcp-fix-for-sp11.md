@@ -1,4 +1,4 @@
-# MCP Toolkit 适配 InoProShop SP11 (CODESYS 3.5.11) 完整修复指南
+# MCP Toolkit 适配 InoProShop SP11 (CODESYS 3.5.11) 修复指南
 
 ## 环境
 
@@ -6,17 +6,7 @@
 - MCP Toolkit: @codesys/mcp-toolkit 1.1.16
 - MCP 配置文件: `.claude/mcp.json`
 
-## 架构改进
-
-原方案每次 MCP 调用启动新 InoProShop 进程 → 打开项目 → 执行 → 关闭。
-**新方案使用常驻 Daemon 进程**：首次调用启动后台 InoProShop，后续操作复用以进程，通过文件传递命令。
-
-```
-首次 open_project:  启动 daemon InoProShop（~30s）
-后续 save/compile/set_code: 复用同一进程（秒级响应）
-```
-
-## 问题根因 (共 4 个)
+## 问题根因
 
 `codesys-mcp-toolkit` 要求 CODESYS SP21+。在 SP11 上有四个兼容性问题：
 
@@ -25,178 +15,57 @@
 3. **GUI 模式下进程不退出** — InoProShop GUI 保持运行，进程不会自然退出
 4. **ASCII 编码导致中文字符报错** — 项目中有中文 POU 名称时，`open(path, 'w')` 默认 ASCII 编码会触发 `UnicodeEncodeError`，需用 `codecs.open(path, 'w', 'utf-8')`
 
+## 架构说明
+
+每次 MCP 工具调用启动独立的 InoProShop 进程（`--runscript`），执行完脚本后进程被 kill。约需 30 秒/次（InoProShop 启动 + 项目加载 + 脚本执行）。
+
+## Daemon 常驻进程方案（已废弃）
+
+**尝试过**：首次 open_project 启动后台 InoProShop 常驻，Python 脚本进入 `while True` 循环，通过文件读写接收命令（CMD:SAVE / CMD:COMPILE / CMD:SET_CODE 等），后续操作复用同一进程，免去启动开销。
+
+**废弃原因**：CODESYS 的 Python 脚本引擎运行在主线程，`while True: time.sleep(N)` 循环会持续占用主线程，导致 GUI 消息泵无法处理窗口消息。表现为：
+- 鼠标移到 InoProShop 窗口上时转圈圈
+- 窗口内任何按钮/菜单都无法点击
+- 无法通过 X 按钮关闭窗口，只能 taskkill 强杀
+
+即使将 sleep 从 0.5s 加大到 3s，情况没有改善——只要循环在主线程运行，GUI 就得不到处理时间。
+
 ## 需要修改的文件
 
 所有文件位于: `C:\Users\<用户名>\AppData\Roaming\npm\node_modules\@codesys\mcp-toolkit\dist\`
 
 ---
 
-### 1. codesys_interop.js — 添加 Daemon 管理系统 + 输出文件轮询
+### 1. codesys_interop.js — 输出文件轮询 + marker 检测
 
-#### 1.1 更新导出声明 (约第 57 行)
+#### 1.1 添加 fileOutput 变量声明 (约第 91 行)
 
-在 `exports.executeCodesysScript = executeCodesysScript;` 之后添加:
-
-```javascript
-exports.startDaemon = startDaemon;
-exports.sendDaemonCommand = sendDaemonCommand;
-exports.shutdownDaemon = shutdownDaemon;
-exports.isDaemonRunning = isDaemonRunning;
-```
-
-#### 1.2 在 SCRIPT_SUCCESS/ERROR_MARKER 常量后添加 Daemon 管理代码 (约第 69 行)
-
-在 `const SCRIPT_ERROR_MARKER = 'SCRIPT_ERROR';` 之后, `function executeCodesysScript` 之前，插入完整 Daemon 模块:
+在 `let exitCode = null;` 之后添加:
 
 ```javascript
-// --- Persistent Daemon Management ---
-let daemonProcess = null;
-let daemonCmdFile = null;
-let daemonRespFile = null;
-let daemonStartupPromise = null;
-let daemonSeq = 0;
-
-function isDaemonRunning() {
-    return daemonProcess !== null && !daemonProcess.killed;
-}
-
-function getDaemonFilePaths() {
-    const tmpDir = os.tmpdir();
-    const base = path.join(tmpDir, 'mcp_codesys_daemon');
-    return {
-        cmd: base + '_cmd.txt',
-        resp: base + '_resp.txt',
-        output: base + '_output.txt',
-    };
-}
-
-function startDaemon(daemonScriptContent, codesysExePath, codesysProfileName, projectPath) {
-    return __awaiter(this, void 0, void 0, function* () {
-        if (isDaemonRunning()) {
-            process.stderr.write('DAEMON: Already running.\n');
-            return true;
-        }
-        const paths = getDaemonFilePaths();
-        daemonCmdFile = paths.cmd;
-        daemonRespFile = paths.resp;
-        const outputFile = paths.output;
-
-        try { fs.unlinkSync(daemonCmdFile); } catch (_) {}
-        try { fs.unlinkSync(daemonRespFile); } catch (_) {}
-        try { fs.unlinkSync(outputFile); } catch (_) {}
-
-        if (!codesysExePath) throw new Error('CODESYS path required');
-        if (!fs.existsSync(codesysExePath)) throw new Error('CODESYS exe not found');
-
-        const codesysDir = path.dirname(codesysExePath);
-        const scriptPath = path.join(os.tmpdir(), 'mcp_codesys_daemon.py');
-
-        const normalizedContent = daemonScriptContent.replace(/\r\n/g, '\n');
-        yield (0, promises_1.writeFile)(scriptPath, normalizedContent, 'latin1');
-
-        const spawnEnv = Object.assign({}, process.env);
-        spawnEnv.PATH = `${codesysDir};${spawnEnv.PATH || ''}`;
-        spawnEnv.MCP_CMD_FILE = daemonCmdFile;
-        spawnEnv.MCP_RESP_FILE = daemonRespFile;
-        spawnEnv.MCP_PROJECT_PATH = projectPath;
-
-        const fullCmd = `"${codesysExePath}" --profile="${codesysProfileName}" --runscript="${scriptPath}"`;
-
-        daemonProcess = (0, child_process_1.spawn)(fullCmd, [], {
-            windowsHide: true, cwd: codesysDir, env: spawnEnv,
-            shell: true, stdio: ['ignore', 'pipe', 'pipe']
-        });
-
-        daemonProcess.on('close', (code) => { daemonProcess = null; });
-        daemonProcess.on('error', () => { daemonProcess = null; });
-
-        // Wait for DAEMON_READY in output file
-        daemonStartupPromise = new Promise((resolve) => {
-            const start = Date.now();
-            const check = setInterval(() => {
-                try {
-                    if (fs.existsSync(outputFile)) {
-                        const content = fs.readFileSync(outputFile, 'utf-8');
-                        if (content.includes('DAEMON_READY')) {
-                            clearInterval(check); resolve(true);
-                        }
-                        if (content.includes('DAEMON_ERROR')) {
-                            clearInterval(check); resolve(false);
-                        }
-                    }
-                } catch (_) {}
-                if (Date.now() - start > 300000) { clearInterval(check); resolve(false); }
-            }, 2000);
-        });
-        return yield daemonStartupPromise;
-    });
-}
-
-function sendDaemonCommand(commandText) {
-    return __awaiter(this, void 0, void 0, function* () {
-        if (!isDaemonRunning()) throw new Error('Daemon not running');
-        daemonSeq++;
-        const seq = daemonSeq;
-
-        try { fs.unlinkSync(daemonRespFile); } catch (_) {}
-        yield (0, promises_1.writeFile)(daemonCmdFile, commandText, 'utf-8');
-
-        return yield new Promise((resolve) => {
-            const start = Date.now();
-            const check = setInterval(() => {
-                try {
-                    if (fs.existsSync(daemonRespFile)) {
-                        const content = fs.readFileSync(daemonRespFile, 'utf-8');
-                        if (content.includes('DAEMON_SUCCESS') || content.includes('DAEMON_ERROR')) {
-                            clearInterval(check);
-                            const success = content.includes('DAEMON_SUCCESS');
-                            resolve({ success, output: content });
-                        }
-                    }
-                } catch (_) {}
-                if (Date.now() - start > 120000) {
-                    clearInterval(check);
-                    resolve({ success: false, output: 'DAEMON_ERROR: Command timeout' });
-                }
-            }, 500);
-        });
-    });
-}
-
-function shutdownDaemon() {
-    return __awaiter(this, void 0, void 0, function* () {
-        if (!isDaemonRunning()) return;
-        try { yield sendDaemonCommand('CMD:EXIT\n'); } catch (_) {}
-        try { daemonProcess.kill('SIGTERM'); } catch (_) {}
-        setTimeout(() => { try { if (daemonProcess && !daemonProcess.killed) daemonProcess.kill('SIGKILL'); } catch (_) {} }, 5000);
-        daemonProcess = null;
-    });
-}
-// --- End Daemon Management ---
+let fileOutput = ''; // For capturing output from redirected stdout file
 ```
 
-#### 1.3 添加 fileOutput 变量声明 (在 executeCodesysScript 函数内, `let exitCode = null;` 之后)
+#### 1.2 添加 outputFilePath 变量 (约第 89 行)
 
-```javascript
-let fileOutput = '';
-```
-
-#### 1.4 添加 outputFilePath (在 `const tempFilePath = ...` 之后)
+在 `const tempFilePath = ...` 之后添加:
 
 ```javascript
 const outputFilePath = tempFilePath + '.out';
 ```
 
-#### 1.5 设置环境变量 MCP_OUTPUT_PATH (在 `spawnEnv.PATH = ...` 之后)
+#### 1.3 设置环境变量 MCP_OUTPUT_PATH (约第 125 行)
+
+在 `spawnEnv.PATH = ...` 之后添加:
 
 ```javascript
 spawnEnv.MCP_OUTPUT_PATH = outputFilePath;
 process.stderr.write(`INTEROP ENV: MCP_OUTPUT_PATH = ${outputFilePath}\n`);
 ```
 
-#### 1.6 添加输出文件轮询 (在 resolveOnce 中增加 interval 清理, timeoutId 后添加轮询)
+#### 1.4 修改 resolveOnce + 添加输出文件轮询 (约第 145-181 行)
 
-resolveOnce 改为:
+修改 resolveOnce 清理 interval:
 
 ```javascript
 const resolveOnce = (result) => {
@@ -212,7 +81,7 @@ const resolveOnce = (result) => {
 };
 ```
 
-timeoutId 后添加:
+在 timeoutId 之后添加文件轮询:
 
 ```javascript
 let outputPollInterval = null;
@@ -225,300 +94,131 @@ outputPollInterval = setInterval(() => {
                 lastFileSize = stats.size;
                 const content = fs.readFileSync(outputFilePath, 'utf-8');
                 if (content.includes('SCRIPT_SUCCESS')) {
+                    process.stderr.write('INTEROP: Detected SCRIPT_SUCCESS in output file, resolving early.\n');
                     resolveOnce({ code: 0, stdout: stdoutData + '\n' + content, stderr: stderrData });
                 } else if (content.includes('SCRIPT_ERROR')) {
+                    process.stderr.write('INTEROP: Detected SCRIPT_ERROR in output file, resolving early.\n');
                     resolveOnce({ code: 1, stdout: stdoutData + '\n' + content, stderr: stderrData });
                 }
             }
         }
-    } catch (_) {}
+    } catch (_) { /* file not ready yet */ }
 }, 2000);
 ```
 
-#### 1.7 在 close, error, abort 事件中都添加 `if (outputPollInterval) clearInterval(outputPollInterval);`
+#### 1.5 在 close, error, abort 事件中清理 interval
 
-#### 1.8 读取输出文件并合并 (在 `exitCode = spawnResult.code;` 之后)
+在 `childProcess.on('close', ...)`, `childProcess.on('error', ...)`, `timeoutSignal.addEventListener('abort', ...)` 中都添加:
+
+```javascript
+if (outputPollInterval) clearInterval(outputPollInterval);
+```
+
+#### 1.6 读取输出文件 (约第 248 行, exitCode 赋值后)
 
 ```javascript
 fileOutput = '';
 try {
     if (fs.existsSync(outputFilePath)) {
         fileOutput = fs.readFileSync(outputFilePath, 'utf-8');
+        process.stderr.write(`INTEROP: Read output file (${fileOutput.length} bytes)\n`);
+    } else {
+        process.stderr.write(`INTEROP: Output file not found: ${outputFilePath}\n`);
     }
-} catch (_) {}
+} catch (fileErr) {
+    process.stderr.write(`INTEROP: Failed to read output file: ${fileErr.message}\n`);
+}
 const combinedOutput = fileOutput + '\n' + output;
 ```
 
-#### 1.9 更新 marker 检测使用 combinedOutput
+#### 1.7 更新 marker 检测使用 combinedOutput (约第 265 行)
 
 ```javascript
 const hasSuccessMarker = combinedOutput.includes(SCRIPT_SUCCESS_MARKER) || stderrOutput.includes(SCRIPT_SUCCESS_MARKER);
 const hasErrorMarker = combinedOutput.includes(SCRIPT_ERROR_MARKER) || stderrOutput.includes(SCRIPT_ERROR_MARKER);
 ```
 
-#### 1.10 最终输出使用 combinedOutput + 清理输出文件
+#### 1.8 最终输出 + 清理输出文件 (约第 327 行)
 
 ```javascript
 if (fileOutput) { output = combinedOutput; }
-// ... 在 return 前添加输出文件清理:
+```
+
+在 return 之前添加:
+
+```javascript
 try {
     if (fs.existsSync(outputFilePath)) {
         yield (0, promises_1.unlink)(outputFilePath);
     }
-} catch (_) {}
+} catch (cleanupErr) { /* ignore cleanup errors */ }
 ```
 
 ---
 
-### 2. server.js — 添加 Daemon 脚本 + 改写工具处理器
+### 2. server.js — stdout 重定向 + UTF-8 编码
 
-#### 2.1 在脚本模板区添加 CODESYS_DAEMON_SCRIPT (约第 133 行, ENSURE_PROJECT_OPEN 之前)
+在三个 Python 脚本模板中添加 stdout 重定向。每个脚本需添加 `import codecs` 和自动刷新包装类。
 
-在 `// --- Python Script Templates (Imported from v1.6.9) ---` 之后添加完整 daemon 脚本:
+#### 2.1 ENSURE_PROJECT_OPEN_PYTHON_SNIPPET (约第 134 行)
 
-```javascript
-        const CODESYS_DAEMON_SCRIPT = `
-import sys, os, codecs, time, traceback
-import scriptengine as script_engine
-
-_output_file = os.environ.get('MCP_OUTPUT_PATH', r'C:\\Users\\<用户名>\\AppData\\Local\\Temp\\mcp_codesys_daemon_output.txt')
-if _output_file:
-    try:
-        class _AF:
-            def __init__(self, f): self.f = f
-            def write(self, s): self.f.write(s); self.f.flush()
-            def flush(self): self.f.flush()
-            def __getattr__(self, n): return getattr(self.f, n)
-        sys.stdout = _AF(codecs.open(_output_file, 'w', 'utf-8'))
-    except: pass
-
-_cmd_file = os.environ.get('MCP_CMD_FILE')
-_resp_file = os.environ.get('MCP_RESP_FILE')
-_project_path = os.environ.get('MCP_PROJECT_PATH', '')
-
-_primary = None
-
-def _ensure_open(target):
-    global _primary
-    import os as _os
-    norm = _os.path.normcase(_os.path.abspath(target))
-    for attempt in range(3):
-        try: _primary = script_engine.projects.primary
-        except: _primary = None
-        if _primary is not None:
-            try:
-                if _os.path.normcase(_os.path.abspath(_primary.path)) == norm:
-                    return True
-            except: pass
-        try:
-            mode = script_engine.VersionUpdateFlags.NoUpdates | script_engine.VersionUpdateFlags.SilentMode
-            _primary = script_engine.projects.open(target, update_flags=mode)
-            if _primary is not None: return True
-        except Exception as e:
-            print("DAEMON_DEBUG: Open error: " + str(e))
-        time.sleep(2.0)
-    return False
-
-def _find_pou(path_str):
-    path_str = path_str.replace('\\\\', '/').strip('/')
-    parts = path_str.split('/')
-    obj = _primary
-    for part in parts:
-        found = obj.find(part, False)
-        if not found: found = obj.find(part, True)
-        if found: obj = found[0]
-        else: return None
-    return obj
-
-# Startup
-if _project_path:
-    if _ensure_open(_project_path):
-        print("DAEMON_READY")
-    else:
-        print("DAEMON_ERROR: Failed to open project")
-        sys.exit(1)
-else:
-    print("DAEMON_READY")
-
-# Command loop
-while True:
-    try:
-        if os.path.exists(_cmd_file):
-            with codecs.open(_cmd_file, 'r', 'utf-8') as f:
-                cmd_text = f.read()
-            try: os.remove(_cmd_file)
-            except: pass
-
-            lines = cmd_text.strip().split('\\n')
-            cmd = lines[0].strip() if lines else ''
-            resp_lines = []
-
-            try:
-                if cmd == 'CMD:OPEN':
-                    target = lines[1].strip() if len(lines) > 1 else _project_path
-                    ok = _ensure_open(target) if target else False
-                    resp_lines.append('DAEMON_SUCCESS' if ok else 'DAEMON_ERROR: open failed')
-
-                elif cmd == 'CMD:SAVE':
-                    if _primary:
-                        _primary.save()
-                        resp_lines.append('DAEMON_SUCCESS: saved')
-                    else:
-                        resp_lines.append('DAEMON_ERROR: no project open')
-
-                elif cmd == 'CMD:COMPILE':
-                    if not _primary:
-                        resp_lines.append('DAEMON_ERROR: no project open')
-                    else:
-                        app = None
-                        try: app = _primary.active_application
-                        except: pass
-                        if app is None:
-                            for c in _primary.get_children(True):
-                                if hasattr(c, 'is_application') and c.is_application and hasattr(c, 'build'):
-                                    app = c; break
-                        if app: app.build(); resp_lines.append('DAEMON_SUCCESS: build started')
-                        else: resp_lines.append('DAEMON_ERROR: no application found')
-
-                elif cmd == 'CMD:SET_CODE':
-                    pou_path = lines[1].strip() if len(lines) > 1 else ''
-                    pou = _find_pou(pou_path)
-                    if pou is None:
-                        resp_lines.append('DAEMON_ERROR: POU not found: ' + pou_path)
-                    else:
-                        decl_code = ''; impl_code = ''; section = None
-                        for i in range(2, len(lines)):
-                            ln = lines[i].strip()
-                            if ln == 'SECTION:DECL': section = 'decl'; continue
-                            elif ln == 'SECTION:IMPL': section = 'impl'; continue
-                            elif ln == 'SECTION:END': section = None; continue
-                            if section == 'decl': decl_code += lines[i] + '\\n'
-                            elif section == 'impl': impl_code += lines[i] + '\\n'
-                        try:
-                            if decl_code: pou.textual_declaration.replace(decl_code)
-                            if impl_code: pou.textual_implementation.replace(impl_code)
-                            _primary.save()
-                            resp_lines.append('DAEMON_SUCCESS: code set for ' + pou_path)
-                        except Exception as e2:
-                            resp_lines.append('DAEMON_ERROR: ' + str(e2))
-
-                elif cmd == 'CMD:GET_STATUS':
-                    s_ok = True; s_open = _primary is not None
-                    s_name = 'No project'; s_path = 'N/A'
-                    if _primary:
-                        try: s_name = _primary.get_name() or 'Unnamed'
-                        except: pass
-                        try: s_path = _primary.path
-                        except: pass
-                    resp_lines.append('Scripting OK: ' + str(s_ok))
-                    resp_lines.append('Project Open: ' + str(s_open))
-                    resp_lines.append('Project Name: ' + s_name)
-                    resp_lines.append('Project Path: ' + s_path)
-                    resp_lines.append('DAEMON_SUCCESS')
-
-                elif cmd == 'CMD:EXIT':
-                    with codecs.open(_resp_file, 'w', 'utf-8') as rf:
-                        rf.write('DAEMON_SUCCESS: exiting')
-                    sys.exit(0)
-
-                else:
-                    resp_lines.append('DAEMON_ERROR: unknown command ' + cmd)
-
-            except Exception as ex:
-                resp_lines.append('DAEMON_ERROR: ' + str(ex))
-                resp_lines.append(traceback.format_exc())
-
-            with codecs.open(_resp_file, 'w', 'utf-8') as rf:
-                rf.write('\\n'.join(resp_lines))
-
-        time.sleep(0.5)
-    except Exception as loop_err:
-        print("DAEMON_LOOP_ERROR: " + str(loop_err))
-        time.sleep(1.0)
-`;
-```
-
-#### 2.2 添加 daemonSend 辅助函数 (在 fileExists 函数之后, MCP Server 初始化之前)
-
-```javascript
-        let _daemonProjectPath = null;
-        function daemonSend(projectPath, command) {
-            return __awaiter(this, void 0, void 0, function* () {
-                if (!(0, codesys_interop_1.isDaemonRunning)()) {
-                    const ok = yield (0, codesys_interop_1.startDaemon)(CODESYS_DAEMON_SCRIPT, codesysExePath, codesysProfileName, projectPath);
-                    if (!ok) throw new Error('Daemon failed to start');
-                    _daemonProjectPath = projectPath;
-                } else if (projectPath && projectPath !== _daemonProjectPath) {
-                    yield (0, codesys_interop_1.sendDaemonCommand)('CMD:OPEN\n' + projectPath);
-                    _daemonProjectPath = projectPath;
-                }
-                return yield (0, codesys_interop_1.sendDaemonCommand)(command);
-            });
-        }
-```
-
-#### 2.3 在三个 Python 脚本模板中添加 stdout 重定向 (保留旧的 fallback 机制)
-
-三个脚本模板: `ENSURE_PROJECT_OPEN_PYTHON_SNIPPET`, `CHECK_STATUS_SCRIPT`, `CREATE_PROJECT_SCRIPT_TEMPLATE`
-
-每个在 import 后添加:
+在 `import os` 之后, `import time` 之前插入:
 
 ```python
-import codecs  # (加入已有 import 行)
+import codecs
 # --- Redirect stdout to file for older CODESYS compatibility ---
-__mcp_out__ = os.environ.get('MCP_OUTPUT_PATH')
-if __mcp_out__:
+__mcp_out_ensure__ = os.environ.get('MCP_OUTPUT_PATH')
+if __mcp_out_ensure__:
     try:
         class _AutoFlushFile:
             def __init__(self, f): self.f = f
             def write(self, s): self.f.write(s); self.f.flush()
             def flush(self): self.f.flush()
             def __getattr__(self, n): return getattr(self.f, n)
-        _f_out = _AutoFlushFile(codecs.open(__mcp_out__, 'w', 'utf-8'))
+        _f_out_ensure = _AutoFlushFile(codecs.open(__mcp_out_ensure__, 'w', 'utf-8'))
+        sys.stdout = _f_out_ensure
+    except: pass
+# --- End stdout redirect ---
+```
+
+#### 2.2 CHECK_STATUS_SCRIPT (约第 328 行)
+
+将 import 行改为 `import sys, scriptengine as script_engine, os, codecs, traceback`，然后插入:
+
+```python
+# --- Redirect stdout to file for older CODESYS compatibility ---
+__mcp_out__ = os.environ.get('MCP_OUTPUT_PATH')
+if __mcp_out__:
+    try:
+        class _AutoFlushFile2:
+            def __init__(self, f): self.f = f
+            def write(self, s): self.f.write(s); self.f.flush()
+            def flush(self): self.f.flush()
+            def __getattr__(self, n): return getattr(self.f, n)
+        _f_out = _AutoFlushFile2(codecs.open(__mcp_out__, 'w', 'utf-8'))
         sys.stdout = _f_out
     except: pass
 # --- End stdout redirect ---
 ```
 
-#### 2.4 改写工具处理器使用 daemonSend
+#### 2.3 CREATE_PROJECT_SCRIPT_TEMPLATE (约第 384 行)
 
-四个核心工具的 try 块改为调用 daemonSend:
+将 import 行改为 `import sys, scriptengine as script_engine, os, shutil, time, codecs, traceback`，然后插入:
 
-**open_project** (约第 1460 行):
-```javascript
-const result = yield daemonSend(absPath, 'CMD:OPEN\n' + absPath);
-const success = result.success;
-```
-
-**save_project** (约第 1540 行):
-```javascript
-const result = yield daemonSend(absPath, 'CMD:SAVE');
-const success = result.success;
-```
-
-**compile_project** (约第 1700 行):
-```javascript
-const result = yield daemonSend(absPath, 'CMD:COMPILE');
-const success = result.success;
-```
-
-**set_pou_code** (约第 1595 行):
-```javascript
-let cmd = 'CMD:SET_CODE\n' + sanPouPath + '\n';
-if (declarationCode !== null && declarationCode !== void 0) {
-    cmd += 'SECTION:DECL\n' + declarationCode + '\n';
-}
-if (implementationCode !== null && implementationCode !== void 0) {
-    cmd += 'SECTION:IMPL\n' + implementationCode + '\n';
-}
-cmd += 'SECTION:END';
-const result = yield daemonSend(absPath, cmd);
-const success = result.success;
-```
-
-**project-status resource** (约第 1318 行):
-```javascript
-const result = yield daemonSend(null, 'CMD:GET_STATUS');
+```python
+# --- Redirect stdout to file for older CODESYS compatibility ---
+__mcp_out_create__ = os.environ.get('MCP_OUTPUT_PATH')
+if __mcp_out_create__:
+    try:
+        class _AutoFlushFile3:
+            def __init__(self, f): self.f = f
+            def write(self, s): self.f.write(s); self.f.flush()
+            def flush(self): self.f.flush()
+            def __getattr__(self, n): return getattr(self.f, n)
+        _f_out_create = _AutoFlushFile3(codecs.open(__mcp_out_create__, 'w', 'utf-8'))
+        sys.stdout = _f_out_create
+    except: pass
+# --- End stdout redirect ---
 ```
 
 ---
@@ -549,27 +249,27 @@ const result = yield daemonSend(null, 'CMD:GET_STATUS');
 
 1. 定位 npm 全局包路径: `%APPDATA%\npm\node_modules\@codesys\mcp-toolkit\dist\`
 2. 按上述修改编辑 `codesys_interop.js` 和 `server.js`
-3. 替换 daemon 脚本中的 `<用户名>` 为实际 Windows 用户名
-4. 配置 `.claude/mcp.json`（替换用户名和项目路径）
-5. **重新加载 VS Code 窗口** (Ctrl+Shift+P → Reload Window)
-6. 测试: `open_project` 启动 daemon (~30s)，后续操作秒级响应
+3. 配置 `.claude/mcp.json`（替换用户名和项目路径）
+4. **重新加载 VS Code 窗口** (Ctrl+Shift+P → Reload Window)
+5. 测试: 调用 `save_project` 验证，约 30-60 秒内返回成功
 
 ## 已验证的 MCP 工具
 
-| 工具 | 模式 | 状态 |
+| 工具 | 状态 | 备注 |
 |------|------|------|
-| open_project | Daemon | 正常（首次启动 daemon ~30s）|
-| save_project | Daemon | 正常（复用进程，秒级）|
-| compile_project | Daemon | 正常（复用进程，秒级）|
-| set_pou_code | Daemon | 正常（复用进程，秒级）|
-| project-status (resource) | Daemon | 正常（复用进程，秒级）|
-| create_pou | Fallback (旧) | 正常 |
-| create_project | Fallback (旧) | 正常 |
+| save_project | 正常 | ~30s/次 |
+| open_project | 正常 | ~30s/次 |
+| compile_project | 正常 | ~30s/次 |
+| set_pou_code | 正常 | ~30s/次 |
+| create_pou | 正常 | ~30s/次 |
+| project-status (resource) | 正常 | ~15s/次 |
 
 ## 注意事项
 
-- **Daemon 进程在首次 `open_project` 时启动**，后续操作自动复用
-- **不再需要关 IDE** — daemon 是独立进程，不会和 IDE 冲突（但不要两个同时写入项目）
-- `--noUI` 不可用（InoProShop SP11 中会导致项目子系统未初始化）
-- 中文 POU 名称需要 `codecs.open(path, 'w', 'utf-8')` 编码
-- 若 daemon 进程意外退出，下次调用会自动重启
+- **每次 MCP 调用启动独立 InoProShop 进程**，约 30 秒（含 InoProShop 启动 + 项目加载 + 脚本执行）
+- **IDE 和 MCP 不能同时打开同一项目** — 文件锁冲突
+- **连续调用间需要间隔** — 确保前一个进程已退出
+- `--noUI` 在 InoProShop SP11 中不可用（项目子系统未初始化）
+- 中文 POU 名称需用 `codecs.open(path, 'w', 'utf-8')`，不可以用 `open(path, 'w')`
+- Daemon 常驻进程方案不可行（CODESYS Python 主线程阻塞导致 GUI 冻结）
+- 如果工具超时，确认已 Reload Window 使 MCP 加载新代码
