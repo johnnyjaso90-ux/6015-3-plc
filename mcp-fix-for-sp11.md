@@ -30,6 +30,10 @@
 
 即使将 sleep 从 0.5s 加大到 3s，情况没有改善——只要循环在主线程运行，GUI 就得不到处理时间。
 
+**ProcessMessageLoop 方案也失败**：在循环中调用 `scriptengine.system.process_messageloop()` 手动泵消息，InoProShop 窗口依然无响应。SP11 的 process_messageloop() 无法在脚本主循环中有效工作。
+
+**结论**：在 InoProShop 1.9.1.6 / CODESYS 3.5.11.80 上，无法实现不阻塞 GUI 的常驻脚本循环。只能用单次脚本模式。
+
 ## 需要修改的文件
 
 所有文件位于: `C:\Users\<用户名>\AppData\Roaming\npm\node_modules\@codesys\mcp-toolkit\dist\`
